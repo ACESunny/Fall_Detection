@@ -7,14 +7,12 @@ from mpl_toolkits.mplot3d import Axes3D
 
 # 1. อ่านข้อมูลจากไฟล์ที่ถูก Label แล้ว
 labeled_data = pd.read_csv('combined_filtered_data_with_new_labels.csv')
-# Remove outliers where Movement_Rate > 1000
 labeled_data = labeled_data[labeled_data['Movement_Rate'] <= 1000]
 X_labeled = labeled_data[['Frame_Rate', 'CoG_Angle', 'Movement_Rate']].values
 y_labeled = labeled_data['Label'].values
 
 # 2. อ่านข้อมูลจากไฟล์ที่ยังไม่มี Label
 unlabeled_data = pd.read_csv('fall.csv')
-# Remove outliers where Movement_Rate > 1000
 unlabeled_data = unlabeled_data[unlabeled_data['Movement_Rate'] <= 1000]
 X_unlabeled = unlabeled_data[['Frame_Rate', 'CoG_Angle', 'Movement_Rate']].values
 

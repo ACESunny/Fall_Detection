@@ -5,32 +5,322 @@ from datetime import datetime
 import time
 import csv
 import os
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from threading import Thread, Event
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
-# ตั้งค่า ZeroMQ
-context = zmq.Context()
-
-# Socket สำหรับรับข้อมูล Pose
-pose_socket = context.socket(zmq.SUB)
-pose_socket.connect("tcp://localhost:5556")
-pose_socket.setsockopt_string(zmq.SUBSCRIBE, "PoseData")
-
-# Socket สำหรับส่งข้อมูล Feature
-feature_socket = context.socket(zmq.PUB)
-feature_socket.bind("tcp://*:5559")
-
-# กำหนดจุดเชื่อมต่อสำหรับคำนวณ Movement Rate
-CONNECTIONS = [(0, 11), (11, 12), (12, 24), (24, 23), (23, 11),
-               (15, 13), (13, 11), (12, 14), (14, 16),
-               (23, 25), (25, 27), (24, 26), (26, 28)]
+class FeatureCalculatorApp:
+    def __init__(self, root):
+        self.root = root
+        self.running = False
+        self.stop_event = Event()
+        self.use_real_scale = False
+        self.save_csv = False
+        self.csv_writer = None
+        self.calculator = None
+        self.feature_history = []
+        self.max_history = 100  # Max data points to keep for plotting
+        
+        self.setup_ui()
+        self.setup_zmq()
+        
+    def setup_ui(self):
+        self.root.title("Feature Calculator")
+        self.root.geometry("1200x800")
+        
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Control frame
+        control_frame = ttk.LabelFrame(main_frame, text="Controls", padding="10")
+        control_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        # Data display frame
+        data_frame = ttk.Frame(main_frame)
+        data_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Text display frame
+        text_frame = ttk.LabelFrame(data_frame, text="Feature Data", padding="10")
+        text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Graph frame
+        graph_frame = ttk.LabelFrame(data_frame, text="Feature Trends", padding="10")
+        graph_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        # Text display
+        self.text_display = tk.Text(text_frame, wrap=tk.WORD, height=15)
+        self.text_display.pack(fill=tk.BOTH, expand=True)
+        
+        scrollbar = ttk.Scrollbar(self.text_display)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text_display.config(yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.text_display.yview)
+        
+        # Setup matplotlib figures
+        self.setup_plots(graph_frame)
+        
+        # Status bar
+        self.status_var = tk.StringVar(value="Ready")
+        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN)
+        status_bar.pack(fill=tk.X, pady=(5, 0))
+        
+        # Settings frame
+        settings_frame = ttk.Frame(control_frame)
+        settings_frame.pack(fill=tk.X, pady=5)
+        
+        # Real scale checkbox
+        self.real_scale_var = tk.BooleanVar()
+        ttk.Checkbutton(settings_frame, text="Use Real Scale", variable=self.real_scale_var).pack(side=tk.LEFT, padx=5)
+        
+        # CSV save checkbox
+        self.csv_var = tk.BooleanVar()
+        ttk.Checkbutton(settings_frame, text="Save to CSV", variable=self.csv_var, command=self.toggle_csv).pack(side=tk.LEFT, padx=5)
+        
+        self.csv_path_var = tk.StringVar()
+        self.csv_entry = ttk.Entry(settings_frame, textvariable=self.csv_path_var, width=40)
+        self.csv_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        self.csv_entry.insert(0, "feature_data.csv")
+        
+        ttk.Button(settings_frame, text="Browse", command=self.browse_csv).pack(side=tk.LEFT, padx=5)
+        
+        # Control buttons
+        btn_frame = ttk.Frame(control_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        
+        self.start_btn = ttk.Button(btn_frame, text="Start", command=self.start_calculation)
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(btn_frame, text="Stop", command=self.stop_calculation, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(btn_frame, text="Clear Data", command=self.clear_data).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(btn_frame, text="Exit", command=self.on_close).pack(side=tk.RIGHT, padx=5)
+        
+    def setup_plots(self, parent_frame):
+        # Create matplotlib figures
+        self.figure = Figure(figsize=(10, 8), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=parent_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Create subplots
+        self.ax1 = self.figure.add_subplot(311)
+        self.ax2 = self.figure.add_subplot(312)
+        self.ax3 = self.figure.add_subplot(313)
+        
+        self.figure.tight_layout(pad=3.0)
+        
+        # Initialize empty plots
+        self.line1, = self.ax1.plot([], [], 'b-')
+        self.line2, = self.ax2.plot([], [], 'r-')
+        self.line3, = self.ax3.plot([], [], 'g-')
+        
+        # Set titles and labels
+        self.ax1.set_title('Frame Rate (fps)')
+        self.ax2.set_title('Center of Gravity Angle (degrees)')
+        self.ax3.set_title('Movement Rate')
+        
+        # Set common x-axis as time
+        for ax in [self.ax1, self.ax2, self.ax3]:
+            ax.set_xlabel('Time')
+            ax.grid(True)
+            ax.xaxis.set_major_locator(MaxNLocator(5))
+        
+    def setup_zmq(self):
+        self.context = zmq.Context()
+        
+        # Socket for receiving Pose data
+        self.pose_socket = self.context.socket(zmq.SUB)
+        self.pose_socket.connect("tcp://localhost:5556")
+        self.pose_socket.setsockopt_string(zmq.SUBSCRIBE, "PoseData")
+        self.pose_socket.setsockopt(zmq.RCVTIMEO, 100)  # 100ms timeout
+        
+        # Socket for sending Feature data
+        self.feature_socket = self.context.socket(zmq.PUB)
+        self.feature_socket.bind("tcp://*:5559")
+        
+        # เพิ่ม socket สำหรับส่งกราฟ
+        self.graph_socket = self.context.socket(zmq.PUB)
+        self.graph_socket.bind("tcp://*:5560")
+        
+    def browse_csv(self):
+        filename = filedialog.asksaveasfilename(
+            title="Select CSV File",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        if filename:
+            self.csv_path_var.set(filename)
+            
+    def toggle_csv(self):
+        self.save_csv = self.csv_var.get()
+        if not self.save_csv and self.csv_writer:
+            self.csv_writer.close()
+            self.csv_writer = None
+            
+    def start_calculation(self):
+        if not self.running:
+            self.use_real_scale = self.real_scale_var.get()
+            self.save_csv = self.csv_var.get()
+            
+            if self.save_csv:
+                csv_filename = self.csv_path_var.get()
+                if not csv_filename:
+                    messagebox.showerror("Error", "Please specify a CSV filename")
+                    return
+                self.csv_writer = CSVWriter(csv_filename)
+            
+            self.calculator = FeatureCalculator(use_real_scale=self.use_real_scale)
+            self.running = True
+            self.stop_event.clear()
+            self.start_btn.config(state=tk.DISABLED)
+            self.stop_btn.config(state=tk.NORMAL)
+            self.status_var.set("Running - Calculating features...")
+            
+            Thread(target=self.process_data, daemon=True).start()
+            
+    def stop_calculation(self):
+        if self.running:
+            self.running = False
+            self.stop_event.set()
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            self.status_var.set("Stopped")
+            
+            if self.csv_writer:
+                self.csv_writer.close()
+                self.csv_writer = None
+                
+    def clear_data(self):
+        self.feature_history = []
+        self.update_plots()
+        self.text_display.delete(1.0, tk.END)
+        self.status_var.set("Data cleared")
+        
+    def process_data(self):
+        while not self.stop_event.is_set():
+            try:
+                topic = self.pose_socket.recv_string()
+                data_json = self.pose_socket.recv_string()
+                pose_data = json.loads(data_json)
+                
+                features = self.calculator.calculate_features(pose_data)
+                
+                if features:
+                    # Send features via ZeroMQ
+                    self.feature_socket.send_string("FeatureData", zmq.SNDMORE)
+                    self.feature_socket.send_string(json.dumps(features))
+                    
+                    # Save to CSV if enabled
+                    if self.save_csv and self.csv_writer:
+                        self.csv_writer.write(features)
+                    
+                    # Update display
+                    self.update_display(features)
+                    
+                    # Store for plotting
+                    self.feature_history.append(features)
+                    if len(self.feature_history) > self.max_history:
+                        self.feature_history.pop(0)
+                    
+                    # Update plots
+                    self.update_plots()
+                    
+            except zmq.Again:
+                continue
+            except Exception as e:
+                self.status_var.set(f"Error: {str(e)}")
+                time.sleep(1)
+                
+    def update_display(self, features):
+        display_text = (
+            f"⏱️ Timestamp: {features['Feature_Timestamp']}\n"
+            f"📊 Frame Rate: {features['Frame_Rate']:.2f} fps\n"
+            f"📐 CoG Angle: {features['CoG_Angle']:.2f} degrees\n"
+            f"🏃 Movement Rate: {features['Movement_Rate']:.4f}\n"
+            "----------------------------------------\n"
+        )
+        
+        self.text_display.insert(tk.END, display_text)
+        self.text_display.see(tk.END)  # Auto-scroll to bottom
+        
+    def update_plots(self):
+        if not self.feature_history:
+            return
+            
+        timestamps = [f['Feature_Timestamp'] for f in self.feature_history]
+        frame_rates = [f['Frame_Rate'] for f in self.feature_history]
+        cog_angles = [f['CoG_Angle'] for f in self.feature_history]
+        movement_rates = [f['Movement_Rate'] for f in self.feature_history]
+        
+        # Convert timestamps to relative time for plotting
+        try:
+            first_time = datetime.strptime(timestamps[0], "%Y-%m-%d %H:%M:%S.%f")
+            rel_times = [datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f") - 
+                         first_time for ts in timestamps
+                         ]
+            x_values = [t.total_seconds() for t in rel_times]
+        except:
+            x_values = range(len(timestamps))
+        
+        # Update plot data
+        self.line1.set_data(x_values, frame_rates)
+        self.line2.set_data(x_values, cog_angles)
+        self.line3.set_data(x_values, movement_rates)
+        
+        # Rescale and redraw
+        for ax, data in zip([self.ax1, self.ax2, self.ax3], 
+                            [frame_rates, cog_angles, movement_rates]):
+            ax.relim()
+            ax.autoscale_view()
+        
+        self.canvas.draw()
+        
+        # แปลงกราฟเป็นภาพและส่ง
+        buf = io.BytesIO()
+        self.figure.savefig(buf, format='jpg')
+        buf.seek(0)
+        img_data = base64.b64encode(buf.getvalue()).decode('utf-8')
+        
+        self.graph_socket.send_string("GraphImage", zmq.SNDMORE)
+        self.graph_socket.send_string(json.dumps({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "frame": img_data
+        }))
+        
+    def on_close(self):
+        self.stop_calculation()
+        self.root.after(100, self.cleanup)
+        self.root.destroy()
+        
+    def cleanup(self):
+        if hasattr(self, 'pose_socket'):
+            self.pose_socket.close()
+        if hasattr(self, 'feature_socket'):
+            self.feature_socket.close()
+        if hasattr(self, 'context'):
+            self.context.term()
+        if self.csv_writer:
+            self.csv_writer.close()
 
 class FeatureCalculator:
     def __init__(self, use_real_scale=False):
         self.prev_frame = None
         self.prev_timestamp = None
         self.use_real_scale = use_real_scale
+        self.connections = [
+            (0, 11), (11, 12), (12, 24), (24, 23), (23, 11),
+            (15, 13), (13, 11), (12, 14), (14, 16),
+            (23, 25), (25, 27), (24, 26), (26, 28)
+        ]
 
     def denormalize(self, x, y, max_width, max_height):
-        """แปลงค่าจาก normalized เป็นขนาดจริง"""
+        """Convert from normalized to real scale"""
         real_x = x * max_width
         real_y = y * max_height
         return real_x, real_y
@@ -45,13 +335,13 @@ class FeatureCalculator:
             max_width = current_data["MAX_Width"]
             max_height = current_data["MAX_Height"]
             
-            # คำนวณ Frame Rate
+            # Calculate Frame Rate
             current_time = datetime.strptime(current_data["Image_Timestamp"], "%Y-%m-%d %H:%M:%S.%f")
             prev_time = datetime.strptime(self.prev_timestamp, "%Y-%m-%d %H:%M:%S.%f")
             time_diff = (current_time - prev_time).total_seconds()
             frame_rate = 1 / time_diff if time_diff > 0 else 0
             
-            # ดึงค่าจาก Landmarks
+            # Get landmarks
             landmarks = current_data["Landmarks"]
             prev_landmarks = self.prev_frame["Landmarks"]
             
@@ -71,11 +361,11 @@ class FeatureCalculator:
             dy = cog_y - nose_y
             cog_angle = np.arctan2(abs(dy), abs(dx)) * (180 / np.pi)
             
-            # คำนวณ Movement Rate
+            # Calculate Movement Rate
             total_distance = 0.0
-            num_connections = len(CONNECTIONS)
+            num_connections = len(self.connections)
             
-            for conn in CONNECTIONS:
+            for conn in self.connections:
                 x1, y1 = landmarks[conn[0]*2], landmarks[conn[0]*2+1]
                 x2, y2 = landmarks[conn[1]*2], landmarks[conn[1]*2+1]
                 x1_prev, y1_prev = prev_landmarks[conn[0]*2], prev_landmarks[conn[0]*2+1]
@@ -94,7 +384,7 @@ class FeatureCalculator:
             avg_distance = total_distance / num_connections
             movement_rate = avg_distance / time_diff if time_diff > 0 else 0.0
             
-            # อัปเดตเฟรมก่อนหน้า
+            # Update previous frame
             self.prev_frame = current_data
             self.prev_timestamp = current_data["Image_Timestamp"]
             
@@ -117,14 +407,11 @@ class CSVWriter:
         self.is_first_write = True
         
     def open(self):
-        # ตรวจสอบว่าไฟล์มีอยู่แล้วหรือไม่
         file_exists = os.path.isfile(self.filename)
         
-        # เปิดไฟล์ในโหมด append
         self.file = open(self.filename, mode='a', newline='')
         self.writer = csv.writer(self.file)
         
-        # ถ้าไฟล์ยังไม่มีอยู่หรือว่างเปล่า ให้เขียน header
         if not file_exists or os.stat(self.filename).st_size == 0:
             self.writer.writerow(["Timestamp", "Frame_Rate", "CoG_Angle", "Movement_Rate"])
             self.is_first_write = False
@@ -140,7 +427,7 @@ class CSVWriter:
                 feature_data["CoG_Angle"],
                 feature_data["Movement_Rate"]
             ])
-            self.file.flush()  # บังคับเขียนข้อมูลลงไฟล์ทันที
+            self.file.flush()
         except Exception as e:
             print(f"Error writing to CSV: {e}")
     
@@ -148,50 +435,11 @@ class CSVWriter:
         if self.file is not None:
             self.file.close()
 
-def main():
-    user_input = input("use_real_scale? (Y/N): ")
-    use_real_scale = True if user_input.upper() == 'Y' else False
-    
-    save_csv = input("Save to CSV file? (Y/N): ").upper() == 'Y'
-    csv_writer = None
-    
-    if save_csv:
-        csv_filename = input("Enter CSV filename (default: feature_data.csv): ") or "feature_data.csv"
-        csv_writer = CSVWriter(csv_filename)
-        print(f"Feature data will be saved to {csv_filename}")
-    
-    calculator = FeatureCalculator(use_real_scale=use_real_scale)
-    print("กำลังรอรับข้อมูลจาก Topic PoseData...")
-    
-    try:
-        while True:
-            try:
-                topic = pose_socket.recv_string()
-                data_json = pose_socket.recv_string()
-                pose_data = json.loads(data_json)
-                
-                features = calculator.calculate_features(pose_data)
-                
-                if features:
-                    feature_socket.send_string("FeatureData", zmq.SNDMORE)
-                    feature_socket.send_string(json.dumps(features))
-                    
-                    print(f"\n⏱️ Timestamp: {features['Feature_Timestamp']}")
-                    print(f"📊 Frame Rate: {features['Frame_Rate']:.2f} fps")
-                    print(f"📐 CoG Angle: {features['CoG_Angle']:.2f} degrees")
-                    print(f"🏃 Movement Rate: {features['Movement_Rate']:.4f}")
-                    
-                    if save_csv and csv_writer:
-                        csv_writer.write(features)
-                        
-            except zmq.Again:
-                time.sleep(0.01)
-            except Exception as e:
-                print(f"เกิดข้อผิดพลาด: {e}")
-                time.sleep(1)
-    finally:
-        if csv_writer:
-            csv_writer.close()
-
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = FeatureCalculatorApp(root)
+    
+    # Handle window close event
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
+    
+    root.mainloop()
